@@ -35,3 +35,5 @@ services:
 volumes:
   pgdata:
   miniodata:
+cd infra
+docker compose up -d
