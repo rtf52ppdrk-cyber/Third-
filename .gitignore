@@ -47,3 +47,10 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.12
 boto3==1.35.81
 redis==5.2.0
+DATABASE_URL=postgresql+psycopg2://reno:reno@localhost:5432/reno
+JWT_SECRET=dev_secret_change_me
+S3_ENDPOINT_URL=http://localhost:9000
+S3_ACCESS_KEY=minio
+S3_SECRET_KEY=minio12345
+S3_BUCKET=reno
+REDIS_URL=redis://localhost:6379/0
