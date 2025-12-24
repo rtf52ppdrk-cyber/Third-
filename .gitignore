@@ -265,3 +265,8 @@ def get_render_job(job_id: str, user: User = Depends(get_current_user), db: Sess
     if not job or job.user_id != user.id:
         raise HTTPException(404, "Job not found")
     return RenderJobOut(id=job.id, status=job.status, created_at=job.created_at)
+cd server
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export $(cat .env | xargs)
+uvicorn main:app --reload --port 8000
