@@ -275,3 +275,25 @@ npx create-expo-app@latest .
 npm i
 npm i @react-navigation/native @react-navigation/native-stack
 npx expo install react-native-screens react-native-safe-area-context
+const API_URL = "http://localhost:8000";
+
+let token: string | null = null;
+
+export function setToken(t: string) {
+  token = t;
+}
+
+async function req(path: string, opts: RequestInit = {}) {
+  const headers: any = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${API_URL}${path}`, { ...opts, headers });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export const api = {
+  devLogin: (email: string) => req("/auth/dev-login", { method: "POST", body: JSON.stringify({ email }) }),
+  listProjects: () => req("/projects"),
+  createProject: (title: string) => req("/projects", { method: "POST", body: JSON.stringify({ title }) }),
+};
+
