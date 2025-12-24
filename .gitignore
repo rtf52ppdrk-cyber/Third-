@@ -54,3 +54,214 @@ S3_ACCESS_KEY=minio
 S3_SECRET_KEY=minio12345
 S3_BUCKET=reno
 REDIS_URL=redis://localhost:6379/0
+import os
+from datetime import datetime, timedelta
+from typing import Optional, List
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+from jose import jwt
+from sqlalchemy import create_engine, Column, String, DateTime, ForeignKey, Integer, Text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+import redis
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+JWT_SECRET = os.getenv("JWT_SECRET", "dev_secret_change_me")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
+
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+# --- Models ---
+def now():
+    return datetime.utcnow()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True)
+    email = Column(String, unique=True, nullable=False)
+    created_at = Column(DateTime, default=now)
+
+class Project(Base):
+    __tablename__ = "projects"
+    id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    title = Column(String, nullable=False)
+    created_at = Column(DateTime, default=now)
+
+class Photo(Base):
+    __tablename__ = "photos"
+    id = Column(String, primary_key=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    original_url = Column(Text, nullable=False)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=now)
+
+class Mask(Base):
+    __tablename__ = "masks"
+    id = Column(String, primary_key=True)
+    photo_id = Column(String, ForeignKey("photos.id"), nullable=False)
+    target = Column(String, nullable=False)  # walls/trim/cabinets/floor/other
+    mask_url = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=now)
+
+class RenderJob(Base):
+    __tablename__ = "render_jobs"
+    id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    photo_id = Column(String, ForeignKey("photos.id"), nullable=False)
+    mask_id = Column(String, ForeignKey("masks.id"), nullable=False)
+    status = Column(String, nullable=False, default="queued")  # queued/running/done/failed
+    command_text = Column(Text, nullable=False)
+    edit_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now)
+
+Base.metadata.create_all(engine)
+
+# --- Schemas ---
+class LoginReq(BaseModel):
+    email: str
+
+class TokenRes(BaseModel):
+    token: str
+
+class ProjectCreate(BaseModel):
+    title: str
+
+class ProjectOut(BaseModel):
+    id: str
+    title: str
+    created_at: datetime
+
+class PhotoCreate(BaseModel):
+    project_id: str
+    original_url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+class MaskCreate(BaseModel):
+    photo_id: str
+    target: str
+    mask_url: str
+
+class RenderJobCreate(BaseModel):
+    photo_id: str
+    mask_id: str
+    command_text: str
+
+class RenderJobOut(BaseModel):
+    id: str
+    status: str
+    created_at: datetime
+
+# --- Auth helpers (simple dev stub) ---
+def make_id(prefix: str) -> str:
+    import uuid
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+def create_token(user_id: str) -> str:
+    payload = {"sub": user_id, "exp": datetime.utcnow() + timedelta(days=30)}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def require_user(token: str = ""):
+    # For MVP dev: accept token in header "Authorization: Bearer <token>"
+    # We'll wire proper dependency below.
+    return token
+
+from fastapi import Header
+def get_current_user(authorization: Optional[str] = Header(default=None), db: Session = Depends(get_db)) -> User:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        user_id = payload.get("sub")
+    except Exception:
+        raise HTTPException(401, "Invalid token")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
+
+app = FastAPI(title="Reno AI API")
+
+# --- Routes ---
+@app.post("/auth/dev-login", response_model=TokenRes)
+def dev_login(req: LoginReq, db: Session = Depends(get_db)):
+    # Creates user if missing. Replace later with Apple/Google Sign-In.
+    user = db.query(User).filter(User.email == req.email).first()
+    if not user:
+        user = User(id=make_id("usr"), email=req.email)
+        db.add(user)
+        db.commit()
+    return TokenRes(token=create_token(user.id))
+
+@app.post("/projects", response_model=ProjectOut)
+def create_project(req: ProjectCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    p = Project(id=make_id("prj"), user_id=user.id, title=req.title)
+    db.add(p); db.commit()
+    return ProjectOut(id=p.id, title=p.title, created_at=p.created_at)
+
+@app.get("/projects", response_model=List[ProjectOut])
+def list_projects(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = db.query(Project).filter(Project.user_id == user.id).order_by(Project.created_at.desc()).all()
+    return [ProjectOut(id=x.id, title=x.title, created_at=x.created_at) for x in rows]
+
+@app.post("/photos")
+def create_photo(req: PhotoCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Ensure project belongs to user
+    prj = db.get(Project, req.project_id)
+    if not prj or prj.user_id != user.id:
+        raise HTTPException(404, "Project not found")
+    ph = Photo(id=make_id("pho"), project_id=req.project_id, original_url=req.original_url, width=req.width, height=req.height)
+    db.add(ph); db.commit()
+    return {"id": ph.id}
+
+@app.post("/masks")
+def create_mask(req: MaskCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ph = db.get(Photo, req.photo_id)
+    if not ph:
+        raise HTTPException(404, "Photo not found")
+    m = Mask(id=make_id("msk"), photo_id=req.photo_id, target=req.target, mask_url=req.mask_url)
+    db.add(m); db.commit()
+    return {"id": m.id}
+
+@app.post("/render-jobs", response_model=RenderJobOut)
+def create_render_job(req: RenderJobCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # basic existence checks
+    ph = db.get(Photo, req.photo_id)
+    mk = db.get(Mask, req.mask_id)
+    if not ph or not mk:
+        raise HTTPException(404, "Photo or mask not found")
+
+    job = RenderJob(
+        id=make_id("job"),
+        user_id=user.id,
+        photo_id=req.photo_id,
+        mask_id=req.mask_id,
+        status="queued",
+        command_text=req.command_text,
+        edit_json=None,
+    )
+    db.add(job); db.commit()
+
+    # push to queue
+    r.lpush("render_jobs", job.id)
+    return RenderJobOut(id=job.id, status=job.status, created_at=job.created_at)
+
+@app.get("/render-jobs/{job_id}", response_model=RenderJobOut)
+def get_render_job(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    job = db.get(RenderJob, job_id)
+    if not job or job.user_id != user.id:
+        raise HTTPException(404, "Job not found")
+    return RenderJobOut(id=job.id, status=job.status, created_at=job.created_at)
